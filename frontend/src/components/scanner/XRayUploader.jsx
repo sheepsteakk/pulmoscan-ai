@@ -15,8 +15,14 @@ function ProgressBar() {
   );
 }
 
-const API_BASE_URL =
-  import.meta.env.VITE_API_BASE_URL || "http://127.0.0.1:8000";
+// 1) Prefer env var
+// 2) If it isn't present (common on GH Pages if not rebuilt), fall back to your Render URL
+// 3) Finally fall back to local dev
+const API_BASE_URL = (
+  import.meta.env.VITE_API_BASE_URL ||
+  "https://pulmoscan-ai-ysey.onrender.com" ||
+  "http://127.0.0.1:8000"
+).trim();
 
 export default function XRayUploader({ onAnalysisComplete }) {
   const [uploading, setUploading] = useState(false);
@@ -35,8 +41,12 @@ export default function XRayUploader({ onAnalysisComplete }) {
         body: formData,
       });
 
+      // Better error details (so you don’t only see “failed”)
       if (!response.ok) {
-        throw new Error(`Backend error: ${response.status}`);
+        const text = await response.text().catch(() => "");
+        throw new Error(
+          `Backend error: ${response.status} ${response.statusText} ${text ? `- ${text}` : ""}`
+        );
       }
 
       const data = await response.json();
@@ -51,8 +61,11 @@ export default function XRayUploader({ onAnalysisComplete }) {
       onAnalysisComplete?.(result);
     } catch (err) {
       console.error("Upload/predict failed:", err);
-      alert("Backend error, please check the FastAPI server console.");
-      setUploading(false);
+      alert(
+        `Backend request failed.\n\nAPI: ${API_BASE_URL}\n\n${
+          err?.message || "Unknown error"
+        }`
+      );
     } finally {
       // small delay so the user sees the loading state
       setTimeout(() => setUploading(false), 400);
@@ -145,7 +158,6 @@ export default function XRayUploader({ onAnalysisComplete }) {
                 </p>
               </div>
 
-              {/* Moving bar */}
               <ProgressBar />
             </motion.div>
           ) : (
