@@ -2,7 +2,6 @@ import React, { useState, useRef } from "react";
 import { UploadCloud, ScanEye } from "lucide-react";
 import { motion, AnimatePresence } from "framer-motion";
 
-// Indeterminate (moving) progress bar using Framer Motion
 function ProgressBar() {
   return (
     <div className="w-full h-2 rounded-full bg-slate-200 overflow-hidden">
@@ -15,18 +14,12 @@ function ProgressBar() {
   );
 }
 
-function normalizeBaseUrl(url) {
-  return String(url || "")
-    .trim()
-    .replace(/\/+$/, ""); // remove trailing slashes
-}
+// Hardcode for now so GH Pages definitely uses the correct backend
+const API_BASE_URL = "https://pulmoscan-ai-ysey.onrender.com";
 
-// 1) Vite env var (only applied at BUILD TIME)
-// 2) fallback to your working Render backend
-// 3) fallback to local dev
-const API_BASE_URL = normalizeBaseUrl(
-  import.meta.env.VITE_API_BASE_URL || "https://pulmoscan-ai-ysey.onrender.com"
-) || "http://127.0.0.1:8000";
+function normalizeBaseUrl(url) {
+  return String(url || "").trim().replace(/\/+$/, "");
+}
 
 export default function XRayUploader({ onAnalysisComplete }) {
   const [uploading, setUploading] = useState(false);
@@ -36,13 +29,13 @@ export default function XRayUploader({ onAnalysisComplete }) {
   const callBackend = async (file) => {
     setUploading(true);
 
+    const base = normalizeBaseUrl(API_BASE_URL);
+
     try {
       const formData = new FormData();
       formData.append("file", file);
 
-      const url = `${API_BASE_URL}/predict`;
-
-      const response = await fetch(url, {
+      const response = await fetch(`${base}/predict`, {
         method: "POST",
         body: formData,
       });
@@ -67,7 +60,7 @@ export default function XRayUploader({ onAnalysisComplete }) {
     } catch (err) {
       console.error("Upload/predict failed:", err);
       alert(
-        `Backend request failed.\n\nAPI: ${API_BASE_URL}\n\n${err?.message || "Unknown error"}`
+        `Backend request failed.\n\nAPI: ${base}\n\n${err?.message || "Unknown error"}`
       );
     } finally {
       setTimeout(() => setUploading(false), 400);
@@ -114,7 +107,7 @@ export default function XRayUploader({ onAnalysisComplete }) {
         onDragLeave={onDragLeave}
         onDrop={onDrop}
         className={`
-          relative overflow-hidden rounded-2xl border-2 border-dashed transition-all
+          relative overflow-hidden rounded-2xl border-2 border-dashed transition-all 
           duration-300 ease-in-out cursor-pointer
           ${
             isDragActive
