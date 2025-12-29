@@ -15,7 +15,9 @@ function ProgressBar() {
 }
 
 // Hardcode for now so GH Pages definitely uses the correct backend
-const API_BASE_URL = "https://pulmoscan-ai-ysey.onrender.com";
+const API_BASE_URL =
+  (import.meta.env.VITE_API_BASE_URL?.trim()) ||
+  "https://pulmoscan-ai-ysey.onrender.com";
 
 function normalizeBaseUrl(url) {
   return String(url || "").trim().replace(/\/+$/, "");
