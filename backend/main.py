@@ -1,27 +1,43 @@
+import os
+
+# Reduce TF log noise on Render
+os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
+
 from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 import io
 import base64
+import json
 import numpy as np
 from PIL import Image, ImageFilter
-import os
-import json
 
 import tensorflow as tf
 from tensorflow.keras.models import load_model
 from tensorflow.keras.applications.efficientnet import preprocess_input
 
-import matplotlib.cm as cm  # for "jet" colormap like Colab
+import matplotlib.cm as cm
 
 IMG_SIZE = 224
 
+# Toggle heavy explanation (occlusion heatmap)
+# Render free tier (512MB) will OOM if you run occlusion with many patches.
+ENABLE_HEATMAP = os.getenv("ENABLE_HEATMAP", "0").strip() == "1"
+
 app = FastAPI()
 
+# CORS: allow your GitHub Pages site + local dev
+# You can keep "*" if you want, but this is cleaner.
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # tighten this for production
+    allow_origins=[
+        "https://sheepsteakk.github.io",
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
+    ],
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -30,8 +46,7 @@ app.add_middleware(
 # --------------------------------------------------
 # Load model + label map
 # --------------------------------------------------
-
-BASE_DIR = os.path.dirname(os.path.abspath(__file__)) 
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))  # backend/
 MODEL_DIR = os.path.join(BASE_DIR, "models")
 
 MODEL_PATH = os.path.join(MODEL_DIR, "pneumonia_model.keras")
@@ -44,67 +59,43 @@ print(f"[Backend] Loading model from {MODEL_PATH}")
 model = load_model(MODEL_PATH)
 
 if os.path.exists(LABEL_MAP_PATH):
-    with open(LABEL_MAP_PATH, "r") as f:
+    with open(LABEL_MAP_PATH, "r", encoding="utf-8") as f:
         label_map = {int(k): v for k, v in json.load(f).items()}
 else:
     label_map = {0: "Normal", 1: "Pneumonia"}
 
 print("[Backend] Label map:", label_map)
-
+print("[Backend] ENABLE_HEATMAP:", ENABLE_HEATMAP)
 
 # --------------------------------------------------
 # Utility helpers
 # --------------------------------------------------
 def read_imagefile(file_bytes: bytes) -> Image.Image:
-    """Load bytes into an RGB PIL image."""
     return Image.open(io.BytesIO(file_bytes)).convert("RGB")
 
-
 def prepare_array_for_model(img_np: np.ndarray) -> np.ndarray:
-    """
-    Take a (H, W, 3) float32 image in [0,255],
-    apply EfficientNet preprocessing and add batch dim.
-    """
     arr = img_np.astype("float32")
     arr = preprocess_input(arr)
     arr = np.expand_dims(arr, axis=0)  # (1, H, W, 3)
     return arr
 
-
 def predict_prob_pneumonia(img_np: np.ndarray) -> float:
-    """
-    Run model on a single (H, W, 3) image array and
-    return pneumonia probability (class 1).
-    """
     batch = prepare_array_for_model(img_np)
     prob = float(model.predict(batch, verbose=0)[0][0])
     return prob
 
-
 def make_occlusion_heatmap_colab_style(
     img_np_224: np.ndarray,
-    patch_size: int = 32,
-    stride: int = 16,
-    # --- Noise cleanup knobs (tune these) ---
-    thr: float = 0.18,          # raise to remove more noise, lower to keep more signal
-    gamma: float = 0.85,        # <1 boosts hotspots, >1 softens
-    blur_radius: float = 1.2,   # 0 disables blur
+    patch_size: int = 64,
+    stride: int = 64,
+    thr: float = 0.18,
+    gamma: float = 0.85,
+    blur_radius: float = 1.2,
 ) -> np.ndarray:
     """
-    Colab-style occlusion sensitivity + optional noise cleanup.
-
-    Colab logic:
-      - baseline pred on original image (224x224)
-      - slide black occlusion patch
-      - heatmap[i,j] = base_pred - occl_pred
-      - clamp >=0, normalize by max
-      - resize back to (224,224) using tf.image.resize
-
-    Added cleanup:
-      - threshold weak values
-      - re-normalize after threshold
-      - gamma shaping
-      - light gaussian blur for smoother heatmaps
+    IMPORTANT:
+    Default patch/stride are made COARSE to avoid OOM.
+    With patch=64 stride=64 -> about 16 occluded predictions instead of ~169.
     """
     base_pred = predict_prob_pneumonia(img_np_224)
 
@@ -119,7 +110,7 @@ def make_occlusion_heatmap_colab_style(
             x = j * stride
 
             occluded = img_np_224.copy()
-            occluded[y:y + patch_size, x:x + patch_size, :] = 0.0
+            occluded[y : y + patch_size, x : x + patch_size, :] = 0.0
 
             occl_pred = predict_prob_pneumonia(occluded)
             heatmap[i, j] = base_pred - occl_pred
@@ -137,12 +128,8 @@ def make_occlusion_heatmap_colab_style(
 
     heatmap_resized = np.clip(heatmap_resized, 0.0, 1.0)
 
-    # -----------------------------
-    # Noise removal / smoothing
-    # -----------------------------
     if thr is not None and thr > 0:
         heatmap_resized = np.where(heatmap_resized >= thr, heatmap_resized, 0.0)
-
         m = float(heatmap_resized.max())
         if m > 0:
             heatmap_resized = heatmap_resized / m
@@ -157,25 +144,17 @@ def make_occlusion_heatmap_colab_style(
 
     return np.clip(heatmap_resized, 0.0, 1.0)
 
-
 def overlay_heatmap_jet_like_colab(
     orig_img: Image.Image,
     heatmap_224: np.ndarray,
     alpha: float = 0.5,
 ) -> Image.Image:
-    """
-    Matches Colab visualization:
-      plt.imshow(orig_arr, cmap="gray")
-      plt.imshow(heatmap_resized, cmap="jet", alpha=0.5)
-
-    We produce a single blended RGB image for the frontend.
-    """
     base_gray = orig_img.convert("L").resize((IMG_SIZE, IMG_SIZE), Image.BILINEAR)
     base_gray = base_gray.convert("RGB")
-    base = np.array(base_gray).astype(np.float32) / 255.0  # (224,224,3)
+    base = np.array(base_gray).astype(np.float32) / 255.0
 
     hm = np.clip(heatmap_224, 0.0, 1.0)
-    jet = cm.get_cmap("jet")(hm)[..., :3]  # (224,224,3) in [0,1]
+    jet = cm.get_cmap("jet")(hm)[..., :3]
 
     blended = (1.0 - alpha) * base + alpha * jet
     blended = np.clip(blended, 0.0, 1.0)
@@ -184,7 +163,6 @@ def overlay_heatmap_jet_like_colab(
     out = out.resize(orig_img.size, Image.BILINEAR)
     return out
 
-
 def pil_to_base64(img: Image.Image) -> str:
     buf = io.BytesIO()
     img.save(buf, format="PNG")
@@ -192,14 +170,12 @@ def pil_to_base64(img: Image.Image) -> str:
     b64 = base64.b64encode(buf.read()).decode("utf-8")
     return f"data:image/png;base64,{b64}"
 
-
 # --------------------------------------------------
 # Endpoints
 # --------------------------------------------------
 @app.get("/health")
 async def health():
-    return {"status": "ok"}
-
+    return {"status": "ok", "heatmap_enabled": ENABLE_HEATMAP}
 
 @app.post("/predict")
 async def predict(file: UploadFile = File(...)):
@@ -207,35 +183,34 @@ async def predict(file: UploadFile = File(...)):
         contents = await file.read()
         pil_img = read_imagefile(contents)
 
-        # --- 1) Classification (224x224) ---
         img_resized = pil_img.resize((IMG_SIZE, IMG_SIZE))
-        img_np = np.array(img_resized).astype("float32")  # [0..255]
+        img_np = np.array(img_resized).astype("float32")
         prob = predict_prob_pneumonia(img_np)
 
         label_idx = int(prob >= 0.5)
         prediction = label_map.get(label_idx, "Pneumonia")
         confidence = prob if label_idx == 1 else 1.0 - prob
 
-        # --- 2) Occlusion heatmap (Colab style + noise cleanup) ---
-        heatmap = make_occlusion_heatmap_colab_style(
-            img_np_224=img_np,
-            patch_size=32,
-            stride=16,
-            thr=0.18,
-            gamma=0.85,
-            blur_radius=1.2,
-        )
-        overlay = overlay_heatmap_jet_like_colab(pil_img, heatmap, alpha=0.5)
-        heatmap_b64 = pil_to_base64(overlay)
+        heatmap_b64 = None
+        if ENABLE_HEATMAP:
+            heatmap = make_occlusion_heatmap_colab_style(
+                img_np_224=img_np,
+                patch_size=64,
+                stride=64,
+                thr=0.18,
+                gamma=0.85,
+                blur_radius=1.2,
+            )
+            overlay = overlay_heatmap_jet_like_colab(pil_img, heatmap, alpha=0.5)
+            heatmap_b64 = pil_to_base64(overlay)
 
-        # --- 3) Original image (frontend display) ---
         original_b64 = pil_to_base64(pil_img)
 
         return JSONResponse(
             {
                 "prediction": prediction,
                 "confidence": confidence,
-                "heatmap": heatmap_b64,
+                "heatmap": heatmap_b64,          # null if disabled
                 "original_image": original_b64,
             }
         )
