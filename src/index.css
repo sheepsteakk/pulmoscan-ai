@@ -1,0 +1,19 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* Base44-like tokens */
+:root {
+  --primary: 79 70 229;
+}
+
+html, body, #root { height: 100%; }
+
+body {
+  margin: 0;
+  color: rgb(15 23 42);
+  background:
+    radial-gradient(900px circle at 50% 0%, rgba(79, 70, 229, 0.14), transparent 60%),
+    radial-gradient(700px circle at 85% 10%, rgba(99, 102, 241, 0.10), transparent 60%),
+    #ffffff;
+}

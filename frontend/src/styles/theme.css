@@ -1,0 +1,22 @@
+:root {
+  --primary: #4f46e5;
+  --primary-hover: #4338ca;
+
+  --bg-base: #ffffff;
+  --bg-glow: rgba(79, 70, 229, 0.12);
+
+  --text-main: #0f172a;
+  --text-muted: #475569;
+}
+
+body {
+  background:
+    radial-gradient(
+      900px circle at 50% 0%,
+      var(--bg-glow),
+      transparent 60%
+    ),
+    var(--bg-base);
+
+  color: var(--text-main);
+}
