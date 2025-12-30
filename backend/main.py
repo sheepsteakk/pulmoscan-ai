@@ -21,14 +21,17 @@ import matplotlib.cm as cm
 
 IMG_SIZE = 224
 
-# Toggle heavy explanation (occlusion heatmap)
-# Render free tier (512MB) will OOM if you run occlusion with many patches.
+# Render free tier (512MB) can OOM if occlusion is too dense.
 ENABLE_HEATMAP = os.getenv("ENABLE_HEATMAP", "0").strip() == "1"
+
+# Heatmap quality vs speed knobs (safe defaults for Render)
+# 64/64 => 16 evals (fast but blocky)
+# 48/24 => ~49 evals (much smoother, still OK)
+OCCLUSION_PATCH = int(os.getenv("OCCLUSION_PATCH", "48"))
+OCCLUSION_STRIDE = int(os.getenv("OCCLUSION_STRIDE", "24"))
 
 app = FastAPI()
 
-# CORS: allow your GitHub Pages site + local dev
-# You can keep "*" if you want, but this is cleaner.
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
@@ -66,6 +69,7 @@ else:
 
 print("[Backend] Label map:", label_map)
 print("[Backend] ENABLE_HEATMAP:", ENABLE_HEATMAP)
+print("[Backend] OCCLUSION_PATCH:", OCCLUSION_PATCH, "OCCLUSION_STRIDE:", OCCLUSION_STRIDE)
 
 # --------------------------------------------------
 # Utility helpers
@@ -73,29 +77,32 @@ print("[Backend] ENABLE_HEATMAP:", ENABLE_HEATMAP)
 def read_imagefile(file_bytes: bytes) -> Image.Image:
     return Image.open(io.BytesIO(file_bytes)).convert("RGB")
 
+
 def prepare_array_for_model(img_np: np.ndarray) -> np.ndarray:
     arr = img_np.astype("float32")
     arr = preprocess_input(arr)
-    arr = np.expand_dims(arr, axis=0)  # (1, H, W, 3)
+    arr = np.expand_dims(arr, axis=0)
     return arr
+
 
 def predict_prob_pneumonia(img_np: np.ndarray) -> float:
     batch = prepare_array_for_model(img_np)
     prob = float(model.predict(batch, verbose=0)[0][0])
     return prob
 
-def make_occlusion_heatmap_colab_style(
+
+def make_occlusion_heatmap(
     img_np_224: np.ndarray,
-    patch_size: int = 48,
-    stride: int = 32,
-    thr: float = 0.18,
-    gamma: float = 0.85,
-    blur_radius: float = 1.2,
+    patch_size: int,
+    stride: int,
+    thr: float = 0.12,
+    gamma: float = 0.9,
+    blur_radius: float = 2.4,
 ) -> np.ndarray:
     """
-    IMPORTANT:
-    Default patch/stride are made COARSE to avoid OOM.
-    With patch=64 stride=64 -> about 16 occluded predictions instead of ~169.
+    Balance of speed + smoothness for Render:
+    - patch/stride controls number of occlusion evals
+    - bicubic resize + stronger blur reduces blockiness
     """
     base_pred = predict_prob_pneumonia(img_np_224)
 
@@ -105,13 +112,11 @@ def make_occlusion_heatmap_colab_style(
     heatmap = np.zeros((out_h, out_w), dtype=np.float32)
 
     for i in range(out_h):
+        y = i * stride
         for j in range(out_w):
-            y = i * stride
             x = j * stride
-
             occluded = img_np_224.copy()
             occluded[y : y + patch_size, x : x + patch_size, :] = 0.0
-
             occl_pred = predict_prob_pneumonia(occluded)
             heatmap[i, j] = base_pred - occl_pred
 
@@ -120,14 +125,16 @@ def make_occlusion_heatmap_colab_style(
     if maxv > 0:
         heatmap = heatmap / maxv
 
+    # Resize with bicubic for smoother interpolation than bilinear
     heatmap_resized = tf.image.resize(
         heatmap[..., np.newaxis],
         (IMG_SIZE, IMG_SIZE),
-        method="bilinear",
+        method="bicubic",
     ).numpy().squeeze()
 
     heatmap_resized = np.clip(heatmap_resized, 0.0, 1.0)
 
+    # Light threshold to remove speckle noise
     if thr is not None and thr > 0:
         heatmap_resized = np.where(heatmap_resized >= thr, heatmap_resized, 0.0)
         m = float(heatmap_resized.max())
@@ -137,6 +144,7 @@ def make_occlusion_heatmap_colab_style(
     if gamma is not None and gamma > 0:
         heatmap_resized = np.power(heatmap_resized, gamma)
 
+    # Stronger blur to reduce block edges
     if blur_radius is not None and blur_radius > 0:
         hm_img = Image.fromarray((heatmap_resized * 255).astype(np.uint8))
         hm_img = hm_img.filter(ImageFilter.GaussianBlur(radius=blur_radius))
@@ -144,7 +152,8 @@ def make_occlusion_heatmap_colab_style(
 
     return np.clip(heatmap_resized, 0.0, 1.0)
 
-def overlay_heatmap_jet_like_colab(
+
+def overlay_heatmap_jet(
     orig_img: Image.Image,
     heatmap_224: np.ndarray,
     alpha: float = 0.5,
@@ -163,6 +172,7 @@ def overlay_heatmap_jet_like_colab(
     out = out.resize(orig_img.size, Image.BILINEAR)
     return out
 
+
 def pil_to_base64(img: Image.Image) -> str:
     buf = io.BytesIO()
     img.save(buf, format="PNG")
@@ -175,7 +185,13 @@ def pil_to_base64(img: Image.Image) -> str:
 # --------------------------------------------------
 @app.get("/health")
 async def health():
-    return {"status": "ok", "heatmap_enabled": ENABLE_HEATMAP}
+    return {
+        "status": "ok",
+        "heatmap_enabled": ENABLE_HEATMAP,
+        "occlusion_patch": OCCLUSION_PATCH,
+        "occlusion_stride": OCCLUSION_STRIDE,
+    }
+
 
 @app.post("/predict")
 async def predict(file: UploadFile = File(...)):
@@ -193,15 +209,15 @@ async def predict(file: UploadFile = File(...)):
 
         heatmap_b64 = None
         if ENABLE_HEATMAP:
-            heatmap = make_occlusion_heatmap_colab_style(
+            heatmap = make_occlusion_heatmap(
                 img_np_224=img_np,
-                patch_size=64,
-                stride=64,
-                thr=0.18,
-                gamma=0.85,
-                blur_radius=1.2,
+                patch_size=OCCLUSION_PATCH,
+                stride=OCCLUSION_STRIDE,
+                thr=0.12,
+                gamma=0.9,
+                blur_radius=2.4,
             )
-            overlay = overlay_heatmap_jet_like_colab(pil_img, heatmap, alpha=0.5)
+            overlay = overlay_heatmap_jet(pil_img, heatmap, alpha=0.5)
             heatmap_b64 = pil_to_base64(overlay)
 
         original_b64 = pil_to_base64(pil_img)
@@ -210,7 +226,7 @@ async def predict(file: UploadFile = File(...)):
             {
                 "prediction": prediction,
                 "confidence": confidence,
-                "heatmap": heatmap_b64,          # null if disabled
+                "heatmap": heatmap_b64,
                 "original_image": original_b64,
             }
         )
