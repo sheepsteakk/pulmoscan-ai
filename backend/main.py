@@ -25,10 +25,16 @@ IMG_SIZE = 224
 ENABLE_HEATMAP = os.getenv("ENABLE_HEATMAP", "0").strip() == "1"
 
 # Heatmap quality vs speed knobs (safe defaults for Render)
-# 64/64 => 16 evals (fast but blocky)
-# 48/24 => ~49 evals (much smoother, still OK)
-OCCLUSION_PATCH = int(os.getenv("OCCLUSION_PATCH", "48"))
-OCCLUSION_STRIDE = int(os.getenv("OCCLUSION_STRIDE", "24"))
+# Suggest on Render: PATCH=64, STRIDE=48 (faster than 48/24, smoother than 64/64)
+OCCLUSION_PATCH = int(os.getenv("OCCLUSION_PATCH", "64"))
+OCCLUSION_STRIDE = int(os.getenv("OCCLUSION_STRIDE", "48"))
+
+# Cleanup knobs
+HEATMAP_THR = float(os.getenv("HEATMAP_THR", "0.15"))         # higher = less speckle
+HEATMAP_GAMMA = float(os.getenv("HEATMAP_GAMMA", "0.9"))       # <1 boosts hotspots slightly
+HEATMAP_BLUR = float(os.getenv("HEATMAP_BLUR", "3.0"))         # stronger blur => less blocky
+HEATMAP_ALPHA = float(os.getenv("HEATMAP_ALPHA", "0.5"))       # overlay strength
+HEATMAP_BORDER = float(os.getenv("HEATMAP_BORDER", "0.12"))    # 12% border masked out
 
 app = FastAPI()
 
@@ -91,24 +97,69 @@ def predict_prob_pneumonia(img_np: np.ndarray) -> float:
     return prob
 
 
+def _mask_borders(hm: np.ndarray, border_frac: float) -> np.ndarray:
+    """Zero out a border region (prevents hotspots on corners/text/borders)."""
+    if border_frac <= 0:
+        return hm
+    H, W = hm.shape
+    by = int(H * border_frac)
+    bx = int(W * border_frac)
+    hm[:by, :] = 0.0
+    hm[-by:, :] = 0.0
+    hm[:, :bx] = 0.0
+    hm[:, -bx:] = 0.0
+    return hm
+
+
+def _remove_small_blobs(hm: np.ndarray, thr: float) -> np.ndarray:
+    """
+    Cheap blob cleanup without extra deps:
+    - threshold
+    - use max-filter then keep only regions that survive local max smoothing
+    This removes isolated speckles but keeps bigger areas.
+    """
+    if thr <= 0:
+        return hm
+
+    x = np.where(hm >= thr, hm, 0.0)
+
+    # Max-filter (approx) using dilation via PIL
+    x_img = Image.fromarray((x * 255).astype(np.uint8))
+    # MaxFilter size 5 is a decent cheap denoise
+    x_img = x_img.filter(ImageFilter.MaxFilter(size=5))
+    x2 = np.array(x_img).astype(np.float32) / 255.0
+
+    # Keep only areas that have support after max-filter
+    x = np.where(x2 > 0, x, 0.0)
+
+    m = float(x.max())
+    if m > 0:
+        x = x / m
+    return x
+
+
 def make_occlusion_heatmap(
     img_np_224: np.ndarray,
     patch_size: int,
     stride: int,
-    thr: float = 0.12,
+    thr: float = 0.15,
     gamma: float = 0.9,
-    blur_radius: float = 2.4,
+    blur_radius: float = 3.0,
+    border_frac: float = 0.12,
 ) -> np.ndarray:
     """
-    Balance of speed + smoothness for Render:
-    - patch/stride controls number of occlusion evals
-    - bicubic resize + stronger blur reduces blockiness
+    Fast-ish occlusion map with:
+    - bicubic upsample (smoother)
+    - border masking (reduces "wrong place" highlights)
+    - small blob cleanup (less speckle)
+    - gaussian blur (reduces blockiness)
     """
     base_pred = predict_prob_pneumonia(img_np_224)
 
     H, W, _ = img_np_224.shape
     out_h = (H - patch_size) // stride + 1
     out_w = (W - patch_size) // stride + 1
+
     heatmap = np.zeros((out_h, out_w), dtype=np.float32)
 
     for i in range(out_h):
@@ -125,7 +176,7 @@ def make_occlusion_heatmap(
     if maxv > 0:
         heatmap = heatmap / maxv
 
-    # Resize with bicubic for smoother interpolation than bilinear
+    # Upsample smoother
     heatmap_resized = tf.image.resize(
         heatmap[..., np.newaxis],
         (IMG_SIZE, IMG_SIZE),
@@ -134,17 +185,17 @@ def make_occlusion_heatmap(
 
     heatmap_resized = np.clip(heatmap_resized, 0.0, 1.0)
 
-    # Light threshold to remove speckle noise
-    if thr is not None and thr > 0:
-        heatmap_resized = np.where(heatmap_resized >= thr, heatmap_resized, 0.0)
-        m = float(heatmap_resized.max())
-        if m > 0:
-            heatmap_resized = heatmap_resized / m
+    # Mask borders (big improvement for "wrong place" highlights)
+    heatmap_resized = _mask_borders(heatmap_resized, border_frac)
 
+    # Remove speckle blobs
+    heatmap_resized = _remove_small_blobs(heatmap_resized, thr)
+
+    # Gamma shaping
     if gamma is not None and gamma > 0:
         heatmap_resized = np.power(heatmap_resized, gamma)
 
-    # Stronger blur to reduce block edges
+    # Smooth edges
     if blur_radius is not None and blur_radius > 0:
         hm_img = Image.fromarray((heatmap_resized * 255).astype(np.uint8))
         hm_img = hm_img.filter(ImageFilter.GaussianBlur(radius=blur_radius))
@@ -190,6 +241,9 @@ async def health():
         "heatmap_enabled": ENABLE_HEATMAP,
         "occlusion_patch": OCCLUSION_PATCH,
         "occlusion_stride": OCCLUSION_STRIDE,
+        "heatmap_thr": HEATMAP_THR,
+        "heatmap_blur": HEATMAP_BLUR,
+        "heatmap_border": HEATMAP_BORDER,
     }
 
 
@@ -213,11 +267,12 @@ async def predict(file: UploadFile = File(...)):
                 img_np_224=img_np,
                 patch_size=OCCLUSION_PATCH,
                 stride=OCCLUSION_STRIDE,
-                thr=0.12,
-                gamma=0.9,
-                blur_radius=2.4,
+                thr=HEATMAP_THR,
+                gamma=HEATMAP_GAMMA,
+                blur_radius=HEATMAP_BLUR,
+                border_frac=HEATMAP_BORDER,
             )
-            overlay = overlay_heatmap_jet(pil_img, heatmap, alpha=0.5)
+            overlay = overlay_heatmap_jet(pil_img, heatmap, alpha=HEATMAP_ALPHA)
             heatmap_b64 = pil_to_base64(overlay)
 
         original_b64 = pil_to_base64(pil_img)
