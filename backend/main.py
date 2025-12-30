@@ -30,6 +30,13 @@ ENABLE_HEATMAP = os.getenv("ENABLE_HEATMAP", "0").strip() == "1"
 OCCLUSION_PATCH = int(os.getenv("OCCLUSION_PATCH", "48"))
 OCCLUSION_STRIDE = int(os.getenv("OCCLUSION_STRIDE", "24"))
 
+# Noise cleanup knobs (cheap, big visual improvement)
+HEATMAP_THR = float(os.getenv("HEATMAP_THR", "0.16"))          # raise to remove more speckles
+HEATMAP_KEEP_TOP = float(os.getenv("HEATMAP_KEEP_TOP", "0.22"))# keep only strongest 22% values
+HEATMAP_MIN_BLOB_PX = int(os.getenv("HEATMAP_MIN_BLOB_PX", "180"))  # drop tiny islands
+HEATMAP_GAMMA = float(os.getenv("HEATMAP_GAMMA", "0.95"))
+HEATMAP_BLUR = float(os.getenv("HEATMAP_BLUR", "2.6"))
+
 app = FastAPI()
 
 app.add_middleware(
@@ -70,6 +77,7 @@ else:
 print("[Backend] Label map:", label_map)
 print("[Backend] ENABLE_HEATMAP:", ENABLE_HEATMAP)
 print("[Backend] OCCLUSION_PATCH:", OCCLUSION_PATCH, "OCCLUSION_STRIDE:", OCCLUSION_STRIDE)
+print("[Backend] HEATMAP_THR:", HEATMAP_THR, "KEEP_TOP:", HEATMAP_KEEP_TOP, "MIN_BLOB_PX:", HEATMAP_MIN_BLOB_PX)
 
 # --------------------------------------------------
 # Utility helpers
@@ -95,14 +103,17 @@ def make_occlusion_heatmap(
     img_np_224: np.ndarray,
     patch_size: int,
     stride: int,
-    thr: float = 0.12,
-    gamma: float = 0.9,
-    blur_radius: float = 2.4,
+    thr: float = 0.16,
+    keep_top: float = 0.22,
+    min_blob_px: int = 180,
+    gamma: float = 0.95,
+    blur_radius: float = 2.6,
 ) -> np.ndarray:
     """
-    Balance of speed + smoothness for Render:
-    - patch/stride controls number of occlusion evals
-    - bicubic resize + stronger blur reduces blockiness
+    Fast-ish occlusion map that looks less blocky and less noisy:
+    - patch/stride controls eval count (speed)
+    - bicubic resize + blur reduces block edges
+    - threshold + top-% filtering + remove tiny blobs reduces speckle noise
     """
     base_pred = predict_prob_pneumonia(img_np_224)
 
@@ -125,7 +136,7 @@ def make_occlusion_heatmap(
     if maxv > 0:
         heatmap = heatmap / maxv
 
-    # Resize with bicubic for smoother interpolation than bilinear
+    # Smoother interpolation than bilinear
     heatmap_resized = tf.image.resize(
         heatmap[..., np.newaxis],
         (IMG_SIZE, IMG_SIZE),
@@ -134,21 +145,48 @@ def make_occlusion_heatmap(
 
     heatmap_resized = np.clip(heatmap_resized, 0.0, 1.0)
 
-    # Light threshold to remove speckle noise
+    # 1) Hard threshold
     if thr is not None and thr > 0:
         heatmap_resized = np.where(heatmap_resized >= thr, heatmap_resized, 0.0)
-        m = float(heatmap_resized.max())
-        if m > 0:
-            heatmap_resized = heatmap_resized / m
 
+    # 2) Keep only top-% intensities (very effective for random speckles)
+    if keep_top is not None and 0 < keep_top < 1:
+        nonzero = heatmap_resized[heatmap_resized > 0]
+        if nonzero.size > 0:
+            cutoff = np.quantile(nonzero, 1.0 - keep_top)
+            heatmap_resized = np.where(heatmap_resized >= cutoff, heatmap_resized, 0.0)
+
+    # Re-normalize after filtering
+    m = float(heatmap_resized.max())
+    if m > 0:
+        heatmap_resized = heatmap_resized / m
+
+    # 3) Gamma shaping
     if gamma is not None and gamma > 0:
         heatmap_resized = np.power(heatmap_resized, gamma)
 
-    # Stronger blur to reduce block edges
+    # 4) Blur to smooth edges
     if blur_radius is not None and blur_radius > 0:
         hm_img = Image.fromarray((heatmap_resized * 255).astype(np.uint8))
         hm_img = hm_img.filter(ImageFilter.GaussianBlur(radius=blur_radius))
         heatmap_resized = np.array(hm_img).astype(np.float32) / 255.0
+
+    # 5) Remove tiny blobs (connected components) at 224x224 (cheap)
+    if min_blob_px is not None and min_blob_px > 0:
+        mask = (heatmap_resized > 0.12).astype(np.uint8)
+        cc = tf.image.connected_components(mask[None, ..., None]).numpy().squeeze()
+
+        if cc.max() > 0:
+            cleaned = np.zeros_like(heatmap_resized)
+            for label in range(1, int(cc.max()) + 1):
+                region = (cc == label)
+                if int(region.sum()) >= int(min_blob_px):
+                    cleaned[region] = heatmap_resized[region]
+
+            heatmap_resized = cleaned
+            m2 = float(heatmap_resized.max())
+            if m2 > 0:
+                heatmap_resized = heatmap_resized / m2
 
     return np.clip(heatmap_resized, 0.0, 1.0)
 
@@ -180,6 +218,7 @@ def pil_to_base64(img: Image.Image) -> str:
     b64 = base64.b64encode(buf.read()).decode("utf-8")
     return f"data:image/png;base64,{b64}"
 
+
 # --------------------------------------------------
 # Endpoints
 # --------------------------------------------------
@@ -190,6 +229,9 @@ async def health():
         "heatmap_enabled": ENABLE_HEATMAP,
         "occlusion_patch": OCCLUSION_PATCH,
         "occlusion_stride": OCCLUSION_STRIDE,
+        "heatmap_thr": HEATMAP_THR,
+        "heatmap_keep_top": HEATMAP_KEEP_TOP,
+        "heatmap_min_blob_px": HEATMAP_MIN_BLOB_PX,
     }
 
 
@@ -213,9 +255,11 @@ async def predict(file: UploadFile = File(...)):
                 img_np_224=img_np,
                 patch_size=OCCLUSION_PATCH,
                 stride=OCCLUSION_STRIDE,
-                thr=0.12,
-                gamma=0.9,
-                blur_radius=2.4,
+                thr=HEATMAP_THR,
+                keep_top=HEATMAP_KEEP_TOP,
+                min_blob_px=HEATMAP_MIN_BLOB_PX,
+                gamma=HEATMAP_GAMMA,
+                blur_radius=HEATMAP_BLUR,
             )
             overlay = overlay_heatmap_jet(pil_img, heatmap, alpha=0.5)
             heatmap_b64 = pil_to_base64(overlay)
