@@ -25,9 +25,8 @@ IMG_SIZE = 224
 ENABLE_HEATMAP = os.getenv("ENABLE_HEATMAP", "0").strip() == "1"
 
 # Heatmap quality vs speed knobs (safe defaults for Render)
-# Suggest on Render: PATCH=64, STRIDE=48 (faster than 48/24, smoother than 64/64)
-OCCLUSION_PATCH = int(os.getenv("OCCLUSION_PATCH", "64"))
-OCCLUSION_STRIDE = int(os.getenv("OCCLUSION_STRIDE", "48"))
+OCCLUSION_PATCH = int(os.getenv("OCCLUSION_PATCH", "96"))
+OCCLUSION_STRIDE = int(os.getenv("OCCLUSION_STRIDE", "96"))
 
 # Cleanup knobs
 HEATMAP_THR = float(os.getenv("HEATMAP_THR", "0.15"))         # higher = less speckle
