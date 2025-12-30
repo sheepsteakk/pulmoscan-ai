@@ -86,8 +86,8 @@ def predict_prob_pneumonia(img_np: np.ndarray) -> float:
 
 def make_occlusion_heatmap_colab_style(
     img_np_224: np.ndarray,
-    patch_size: int = 64,
-    stride: int = 64,
+    patch_size: int = 48,
+    stride: int = 32,
     thr: float = 0.18,
     gamma: float = 0.85,
     blur_radius: float = 1.2,
