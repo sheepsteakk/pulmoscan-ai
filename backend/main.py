@@ -223,8 +223,8 @@ async def predict(file: UploadFile = File(...)):
             {
                 "prediction": prediction,
                 "confidence": confidence,
-                "heatmap": heatmap_b64,  # null if disabled
-                "original_image": original_b64,
+                "heatmap": None,  # null if disabled
+                "original_image": None,
             }
         )
 
