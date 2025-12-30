@@ -22,12 +22,13 @@ import matplotlib.cm as cm
 IMG_SIZE = 224
 
 # Toggle heavy explanation (occlusion heatmap)
-# Render free tier (512MB) can OOM if occlusion grid is too fine.
+# Render free tier (512MB) will OOM if you run occlusion with many patches.
 ENABLE_HEATMAP = os.getenv("ENABLE_HEATMAP", "0").strip() == "1"
 
 app = FastAPI()
 
 # CORS: allow your GitHub Pages site + local dev
+# You can keep "*" if you want, but this is cleaner.
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
@@ -72,35 +73,29 @@ print("[Backend] ENABLE_HEATMAP:", ENABLE_HEATMAP)
 def read_imagefile(file_bytes: bytes) -> Image.Image:
     return Image.open(io.BytesIO(file_bytes)).convert("RGB")
 
-
 def prepare_array_for_model(img_np: np.ndarray) -> np.ndarray:
     arr = img_np.astype("float32")
     arr = preprocess_input(arr)
     arr = np.expand_dims(arr, axis=0)  # (1, H, W, 3)
     return arr
 
-
 def predict_prob_pneumonia(img_np: np.ndarray) -> float:
     batch = prepare_array_for_model(img_np)
     prob = float(model.predict(batch, verbose=0)[0][0])
     return prob
 
-
 def make_occlusion_heatmap_colab_style(
     img_np_224: np.ndarray,
     patch_size: int = 48,
-    stride: int = 24,
-    thr: float = 0.10,
+    stride: int = 32,
+    thr: float = 0.18,
     gamma: float = 0.85,
-    blur_radius: float = 2.0,
+    blur_radius: float = 1.2,
 ) -> np.ndarray:
     """
-    Occlusion sensitivity map:
-      heat = base_pred - occluded_pred, clamped to >=0 and normalized.
-
-    patch_size + stride control smoothness:
-      - smaller stride = less blocky but more compute/memory
-      - Render free tier may OOM if too fine, so keep it moderate
+    IMPORTANT:
+    Default patch/stride are made COARSE to avoid OOM.
+    With patch=64 stride=64 -> about 16 occluded predictions instead of ~169.
     """
     base_pred = predict_prob_pneumonia(img_np_224)
 
@@ -133,25 +128,21 @@ def make_occlusion_heatmap_colab_style(
 
     heatmap_resized = np.clip(heatmap_resized, 0.0, 1.0)
 
-    # threshold weak noise
     if thr is not None and thr > 0:
         heatmap_resized = np.where(heatmap_resized >= thr, heatmap_resized, 0.0)
         m = float(heatmap_resized.max())
         if m > 0:
             heatmap_resized = heatmap_resized / m
 
-    # gamma shaping
     if gamma is not None and gamma > 0:
         heatmap_resized = np.power(heatmap_resized, gamma)
 
-    # blur for smoother look
     if blur_radius is not None and blur_radius > 0:
         hm_img = Image.fromarray((heatmap_resized * 255).astype(np.uint8))
         hm_img = hm_img.filter(ImageFilter.GaussianBlur(radius=blur_radius))
         heatmap_resized = np.array(hm_img).astype(np.float32) / 255.0
 
     return np.clip(heatmap_resized, 0.0, 1.0)
-
 
 def overlay_heatmap_jet_like_colab(
     orig_img: Image.Image,
@@ -172,7 +163,6 @@ def overlay_heatmap_jet_like_colab(
     out = out.resize(orig_img.size, Image.BILINEAR)
     return out
 
-
 def pil_to_base64(img: Image.Image) -> str:
     buf = io.BytesIO()
     img.save(buf, format="PNG")
@@ -180,14 +170,12 @@ def pil_to_base64(img: Image.Image) -> str:
     b64 = base64.b64encode(buf.read()).decode("utf-8")
     return f"data:image/png;base64,{b64}"
 
-
 # --------------------------------------------------
 # Endpoints
 # --------------------------------------------------
 @app.get("/health")
 async def health():
     return {"status": "ok", "heatmap_enabled": ENABLE_HEATMAP}
-
 
 @app.post("/predict")
 async def predict(file: UploadFile = File(...)):
@@ -205,14 +193,13 @@ async def predict(file: UploadFile = File(...)):
 
         heatmap_b64 = None
         if ENABLE_HEATMAP:
-            # less blocky than 64/64, but still moderate for Render memory
             heatmap = make_occlusion_heatmap_colab_style(
                 img_np_224=img_np,
-                patch_size=48,
-                stride=24,
-                thr=0.10,
+                patch_size=64,
+                stride=64,
+                thr=0.18,
                 gamma=0.85,
-                blur_radius=2.0,
+                blur_radius=1.2,
             )
             overlay = overlay_heatmap_jet_like_colab(pil_img, heatmap, alpha=0.5)
             heatmap_b64 = pil_to_base64(overlay)
@@ -223,8 +210,8 @@ async def predict(file: UploadFile = File(...)):
             {
                 "prediction": prediction,
                 "confidence": confidence,
-                "heatmap": None,  # null if disabled
-                "original_image": None,
+                "heatmap": heatmap_b64,          # null if disabled
+                "original_image": original_b64,
             }
         )
 
