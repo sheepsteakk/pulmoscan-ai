@@ -27,8 +27,8 @@ ENABLE_HEATMAP = os.getenv("ENABLE_HEATMAP", "0").strip() == "1"
 # Heatmap quality vs speed knobs (safe defaults for Render)
 # 64/64 => 16 evals (fast but blocky)
 # 48/24 => ~49 evals (much smoother, still OK)
-OCCLUSION_PATCH = int(os.getenv("OCCLUSION_PATCH", "48"))
-OCCLUSION_STRIDE = int(os.getenv("OCCLUSION_STRIDE", "24"))
+OCCLUSION_PATCH = int(os.getenv("OCCLUSION_PATCH", "96"))
+OCCLUSION_STRIDE = int(os.getenv("OCCLUSION_STRIDE", "64"))
 
 app = FastAPI()
 
